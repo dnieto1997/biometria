@@ -80,7 +80,7 @@ android {
     namespace "com.biometriafacial"
     defaultConfig {
         applicationId "com.biometriafacial"
-        minSdkVersion rootProject.ext.minSdkVersion
+        minSdkVersion 26
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
