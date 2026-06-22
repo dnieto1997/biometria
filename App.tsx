@@ -11,10 +11,12 @@ import {
 } from './storage/contactsCache';
 import { getHttps, postRegister } from './api/axios';
 import { clearQueue, getQueue } from './storage/offlineQueue';
+import axios from 'axios';
 
 function App() {
   const syncingRef = useRef(false);
   const BASE_URL = 'https://biometria.lavianda.com.co/V1/';
+  const isOnlineRef = useRef(false);
 
   // Solicitar permiso de ubicación
   const requestLocationPermission = async (): Promise<boolean> => {
@@ -44,25 +46,10 @@ function App() {
     requestLocationPermission();
   }, []);
 
-  const cleanOldCache = async () => {
-  const files = await RNFS.readDir(RNFS.CachesDirectoryPath);
 
-  const oldFiles = files.filter(f =>
-    f.name.startsWith('face-')
-  );
 
-  for (const f of oldFiles) {
-    try {
-      await RNFS.unlink(f.path);
-    } catch {}
-  }
-};
 
-useEffect(() => {
-  cleanOldCache();
-}, []);
-
-  // Sincronizar la cola offline
+  
   const syncOfflineQueue = async () => {
     if (syncingRef.current) return;
     syncingRef.current = true;
@@ -92,6 +79,11 @@ useEffect(() => {
 
       for (const item of queue) {
         try {
+           const cleanPath1 = item.photoUri.replace('file://', '');
+    const exists1 = await RNFS.exists(cleanPath1);
+
+    console.log('📂 FOTO EXISTE?', exists1, cleanPath1);
+
           const formData = new FormData();
           formData.append('contact_id', String(item.contact_id));
           formData.append('photo', {
@@ -105,14 +97,22 @@ useEffect(() => {
           formData.append('time', item.time);
           console.log(item)
 
-           const response = await fetch(`${BASE_URL}contacts/verify-face-offline`, {
-    method: 'POST',
-    body: formData,
-    // No necesitas poner headers Content-Type, fetch lo hace automáticamente
-  });
+       const  response = await axios.post(
+  `${BASE_URL}contacts/verify-face-offline`,
+  formData,
+  {
+    headers: {
+      'Content-Type': 'multipart/form-data',
+    },
+    timeout: 15000,
+  }
+);
 
-  const data = await response.json();
-  console.log('📤 Respuesta del servidor:', data);
+  console.log('📥 Respuesta servidor:', response.data);
+
+  if (!response.data?.success) {
+    throw new Error('El servidor no confirmó inserción');
+  }
     const cleanPath = item.photoUri.replace('file://', '');
     const exists = await RNFS.exists(cleanPath);
 
@@ -122,6 +122,7 @@ useEffect(() => {
     }
           console.log('✅ Registro enviado:', item.contact_id, item.time);
         } catch (err) {
+          console.log("error", err)
           console.log('❌ Error enviando item:', err);
           console.log('Item fallido:', err);
           failedItems.push(item);
@@ -145,13 +146,20 @@ useEffect(() => {
     }
   };
 
-  // Manejar sincronización al montar y al reconectarse
-  useEffect(() => {
-    const handleConnectivityChange = async (state: any) => {
-      if (!state.isConnected) return;
 
-      console.log('🌐 Internet disponible, sincronizando...');
-      await syncOfflineQueue();
+
+useEffect(() => {
+  const unsubscribe = NetInfo.addEventListener(async (state) => {
+    const wasOnline = isOnlineRef.current;
+    const nowOnline = !!state.isConnected;
+
+    isOnlineRef.current = nowOnline;
+
+    // SOLO cuando pasa de OFFLINE → ONLINE
+    if (!wasOnline && nowOnline) {
+      console.log("🌐 Internet restaurado");
+
+      await startBackgroundSync();
 
       try {
         const mustSync = await shouldSyncContacts();
@@ -165,16 +173,40 @@ useEffect(() => {
       } catch (err) {
         console.warn('❌ Error sincronizando contactos', err);
       }
-    };
+    }
+  });
 
-    // Escuchar cambios de conectividad
-    const unsubscribe = NetInfo.addEventListener(handleConnectivityChange);
+  return () => unsubscribe();
+}, []);
 
-    // Ejecutar al montar si ya hay internet
-    NetInfo.fetch().then(handleConnectivityChange);
+const startBackgroundSync = async () => {
+  const queue = await getQueue();
 
-    return () => unsubscribe();
-  }, []);
+  if (!queue || queue.length === 0) {
+    console.log("📦 No hay nada que sincronizar");
+    return;
+  }
+
+  console.log("🚀 Sincronizando en segundo plano");
+
+  let attempts = 0;
+
+  while (attempts < 5) {
+    await syncOfflineQueue();
+
+    const remaining = await getQueue();
+    if (!remaining || remaining.length === 0) {
+      console.log("✅ Sincronización completa");
+      return;
+    }
+
+    attempts++;
+    console.log(`🔁 Reintentando intento ${attempts}`);
+    await new Promise((res:any) => setTimeout(res, 4000));
+  }
+
+  console.log("⚠ No se pudo completar sincronización");
+};
 
   const isDarkMode = useColorScheme() === 'dark';
 

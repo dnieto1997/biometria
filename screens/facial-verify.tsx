@@ -1,12 +1,6 @@
-// FacialVerify.tsx (GPS y cámara sincronizados)
 'use strict';
-import React, {
-  useEffect,
-  useRef,
-  useState,
-  useCallback,
-  useMemo,
-} from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
+
 import {
   View,
   Text,
@@ -16,11 +10,18 @@ import {
   Platform,
   PermissionsAndroid,
   TouchableOpacity,
-  Linking,
-  
+  AppState,
 } from 'react-native';
+
 import { SafeAreaView } from 'react-native-safe-area-context';
 import RNBlobUtil from 'react-native-blob-util';
+import RNFS from 'react-native-fs';
+
+import {
+  promptForEnableLocationIfNeeded,
+  isLocationEnabled,
+} from 'react-native-android-location-enabler';
+
 import {
   Camera,
   useCameraDevice,
@@ -29,512 +30,676 @@ import {
   useFrameProcessor,
 } from 'react-native-vision-camera';
 
-import {  useFaceDetector,FrameFaceDetectionOptions  } from 'react-native-vision-camera-face-detector';
+import {
+  useFaceDetector,
+  FrameFaceDetectionOptions,
+} from 'react-native-vision-camera-face-detector';
+
 import { Worklets } from 'react-native-worklets-core';
 
 import NetInfo from '@react-native-community/netinfo';
-import RNFS from 'react-native-fs';
 import { useRoute, RouteProp, useNavigation } from '@react-navigation/native';
 import { addToQueue } from '../storage/offlineQueue';
-
 import Geolocation from '@react-native-community/geolocation';
 
+// ---------------- TYPES ----------------
+type RouteParams = {
+  FacialVerify: {
+    contact_id: number;
+  };
+};
 
-
-type RouteParams = { FacialVerify: { contact_id: number } };
-const CHALLENGES = ['LEFT', 'RIGHT', 'SMILE', 'BLINK3'] as const;
-type ChallengeType = (typeof CHALLENGES)[number];
 type SimpleFace = {
   yawAngle: number;
   smilingProbability: number;
   leftEyeOpenProbability: number;
   rightEyeOpenProbability: number;
+  faceWidth?: number;
+  faceHeight?: number;
+  x?: number;
+  y?: number;
+  frameWidth?: number;
+  frameHeight?: number;
 };
 
 export default function FacialVerify() {
   const route = useRoute<RouteProp<RouteParams, 'FacialVerify'>>();
-    const navigation = useNavigation<any>();
+  const navigation = useNavigation<any>();
+
   const { contact_id } = route.params;
-const [failedChallenge, setFailedChallenge] = useState<ChallengeType | null>(null);
+
+  const [faceMessage, safeSetMessage] = useState('Detectando rostro...');
 
   const device = useCameraDevice('front');
-  const { hasPermission } = useCameraPermission();
+  const { hasPermission, requestPermission } = useCameraPermission();
+
   const format = useCameraFormat(device ?? undefined, [
-    { photoResolution: { width: 1280, height: 720 } },
+    {
+      photoResolution: {
+        width: 1280,
+        height: 720,
+      },
+    },
   ]);
-  const [gpsEnabled, setGpsEnabled] = useState<boolean>(true);
+
   const cameraRef = useRef<Camera>(null);
+
   const BASE_URL = 'https://biometria.lavianda.com.co/V1/';
 
-  const [location, setLocation] = useState<{
-    latitude: number;
-    longitude: number;
-  } | null>(null);
-  const [gpsReadings, setGpsReadings] = useState<number[]>([]);
-  const [ready, setReady] = useState(false); // listo = cámara + GPS
-  const [faceDetected, setFaceDetected] = useState(false);
-  const [blinkCount, setBlinkCount] = useState(0);
+  const [ready, setReady] = useState(false);
   const [processing, setProcessing] = useState(false);
-  const [completed, setCompleted] = useState<ChallengeType[]>([]);
-  const [currentChallenge, setCurrentChallenge] =
-    useState<ChallengeType | null>(null);
+  const [faceDetected, setFaceDetected] = useState(false);
 
-  const currentChallengeRef = useRef<ChallengeType | null>(null);
-  const stableFramesRef = useRef(0);
-  const blinkCountRef = useRef(0);
-  const eyesClosedRef = useRef(false);
+  // =========================
+  // REFS
+  // =========================
+  const capturingRef = useRef(false);
+  const validatedRef = useRef(false);
 
-  const blinkThresholdClosed = 0.5;
-  const blinkThresholdOpen = 0.7;
-  const yawThreshold = 10;
-  const stableFramesNeeded = 3;
+  const movementFramesRef = useRef(0);
+  const stableMovementRef = useRef(0);
 
-  const faceDetectionOptions: FrameFaceDetectionOptions  = {
+  const lastYawRef = useRef<number | null>(null);
+  const movementScoreRef = useRef(0);
+
+  const flatScoreRef = useRef(0);
+  const lastFaceSizeRef = useRef<number | null>(null);
+
+  // =========================
+  // FACE DETECTOR
+  // =========================
+  const faceDetectionOptions: FrameFaceDetectionOptions = {
     performanceMode: 'accurate',
     classificationMode: 'all',
     landmarkMode: 'all',
     trackingEnabled: false,
   };
+
   const { detectFaces } = useFaceDetector(faceDetectionOptions);
-const requestLocationPermission = async (): Promise<boolean> => {
-  if (Platform.OS === 'android') {
-    const granted = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      {
-        title: 'Permiso de ubicación',
-        message: 'La app necesita acceder a tu ubicación',
-        buttonPositive: 'Aceptar',
-        buttonNegative: 'Cancelar',
-      },
-    );
-    return granted === PermissionsAndroid.RESULTS.GRANTED;
-  }
-  return true; // iOS maneja aparte
-};
 
+  // =========================
+  // LOCATION
+  // =========================
+  const [location, setLocation] = useState<{
+    latitude: number;
+    longitude: number;
+  } | null>(null);
 
+  // =========================
+  // PERMISO UBICACIÓN
+  // =========================
+  const requestLocationPermission = async (): Promise<boolean> => {
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        {
+          title: 'Permiso de ubicación',
+          message: 'La app necesita acceder a tu ubicación',
+          buttonPositive: 'Aceptar',
+          buttonNegative: 'Cancelar',
+        },
+      );
 
-const getFastLocation = (): Promise<{ latitude: number; longitude: number }> => {
-  return new Promise((resolve) => {
-    let resolved = false;
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    }
 
-    // 1️⃣ Intentar la última posición disponible (rápida)
-    Geolocation.getCurrentPosition(
-      (pos) => {
-        if (!resolved) {
-          resolved = true;
-          console.log('GPS rápido:', pos.coords.latitude, pos.coords.longitude);
-          resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-        }
-      },
-      (err) => console.warn('getCurrentPosition error:', err),
-      { enableHighAccuracy: false, timeout: 3000, maximumAge: 10000 }
-    );
+    return true;
+  };
 
-    // 2️⃣ Escuchar GPS real (alta precisión)
-    const watchId = Geolocation.watchPosition(
-      (pos) => {
-        if (!resolved) {
-          resolved = true;
-          console.log('GPS real fijo:', pos.coords.latitude, pos.coords.longitude);
-          resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-        }
-        // Actualizar constantemente mientras la pantalla está activa
-        setLocation({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
-      },
-      (err) => console.warn('watchPosition error:', err),
-      { enableHighAccuracy: true, distanceFilter: 0, interval: 1000, fastestInterval: 500 }
-    );
+  // =========================
+  // GPS
+  // =========================
+  const getFastLocation = (): Promise<{
+    latitude: number;
+    longitude: number;
+  }> => {
+    return new Promise((resolve, reject) => {
+      let resolved = false;
+      let watchId: number;
 
-    // 3️⃣ Timeout fallback 10s
-    setTimeout(() => {
-      if (!resolved) {
+      let lastValid: {
+        latitude: number;
+        longitude: number;
+      } | null = null;
+
+      const isValid = (lat: number, lng: number) =>
+        lat !== 0 &&
+        lng !== 0 &&
+        Math.abs(lat) > 0.0001 &&
+        Math.abs(lng) > 0.0001;
+
+      const finish = (
+        data?: {
+          latitude: number;
+          longitude: number;
+        },
+      ) => {
+        if (resolved) return;
+
         resolved = true;
-        console.warn('GPS timeout: ubicacion fallback 0,0');
-        resolve({ latitude: 0, longitude: 0 });
-      }
-      Geolocation.clearWatch(watchId);
-    }, 10000);
-  });
-};
-useEffect(() => {
-  let mounted = true;
 
-  const initCameraAndLocation = async () => {
-    try {
-      // 1️⃣ Permiso cámara
-      const camStatus = await Camera.requestCameraPermission();
-      if (camStatus !== 'granted') {
-        Alert.alert('Permiso de cámara requerido');
-        return;
-      }
+        Geolocation.clearWatch(watchId);
 
-      // 2️⃣ Permiso GPS
-      const hasLocationPermission = await requestLocationPermission();
-      if (!hasLocationPermission) {
-        Alert.alert(
-          'Permiso de ubicación',
-          'La app necesita acceder al GPS para continuar',
-          [
-            {
-              text: 'Abrir configuración',
-              onPress: () => Linking.openSettings(),
-            },
-          ],
-          { cancelable: false }
-        );
-        return;
-      }
+        if (data) {
+          setLocation(data);
+          resolve(data);
+        } else {
+          reject(new Error('No se pudo obtener GPS válido'));
+        }
+      };
 
-      // 3️⃣ Intentar obtener ubicación rápida
-      const loc = await getFastLocation();
+      Geolocation.getCurrentPosition(
+        ({ coords }) => {
+          if (isValid(coords.latitude, coords.longitude)) {
+            lastValid = {
+              latitude: coords.latitude,
+              longitude: coords.longitude,
+            };
 
-    
-      if (!mounted) return;
-      setLocation(loc);
-      setReady(true);
-    } catch (e) {
-      console.warn('Error inicializando cámara/GPS:', e);
-      if (!mounted) return;
-      setLocation({ latitude: 0, longitude: 0 });
-      setReady(true);
-    }
-  };
+            finish(lastValid);
+          }
+        },
+        () => {},
+        {
+          enableHighAccuracy: false,
+          timeout: 3000,
+          maximumAge: 10000,
+        },
+      );
 
-  initCameraAndLocation();
+      watchId = Geolocation.watchPosition(
+        ({ coords }) => {
+          if (isValid(coords.latitude, coords.longitude)) {
+            lastValid = {
+              latitude: coords.latitude,
+              longitude: coords.longitude,
+            };
 
-  return () => { mounted = false; };
-}, []);
+            finish(lastValid);
+          }
+        },
+        () => {},
+        {
+          enableHighAccuracy: true,
+          distanceFilter: 0,
+          interval: 1000,
+          fastestInterval: 500,
+        },
+      );
 
-
-  // -------------------- Generar retos --------------------
-  const generateChallenge = useCallback(() => {
-    const remaining = CHALLENGES.filter(c => !completed.includes(c));
-    if (remaining.length === 0) return;
-
-    const newChallenge =
-      remaining[Math.floor(Math.random() * remaining.length)];
-    setCurrentChallenge(newChallenge);
-    currentChallengeRef.current = newChallenge;
-
-    stableFramesRef.current = 0;
-    blinkCountRef.current = 0;
-    eyesClosedRef.current = false;
-    setBlinkCount(0);
-
-    console.log('Nuevo reto generado:', newChallenge);
-  }, [completed]);
-
-  useEffect(() => {
-    if (ready) generateChallenge();
-  }, [ready]);
-
-  // -------------------- Completar reto --------------------
-  const completeChallenge = useCallback(() => {
-    const challenge = currentChallengeRef.current;
-    if (!challenge) return;
-
-    currentChallengeRef.current = null; // bloquear reto actual
-
-    setCompleted(prev => {
-      if (prev.includes(challenge)) return prev;
-
-      const updated = [...prev, challenge];
-
-      // Reiniciar contadores
-      stableFramesRef.current = 0;
-      blinkCountRef.current = 0;
-      eyesClosedRef.current = false;
-      setBlinkCount(0);
-
-      if (updated.length === CHALLENGES.length) {
-        takeFinalPhoto(); // todos completados → foto final
-      } else {
-        // Generar el siguiente reto usando el array actualizado
-        setTimeout(() => {
-          generateChallengeWithCompleted(updated);
-        }, 300);
-      }
-
-      return updated;
+      setTimeout(() => {
+        if (lastValid) finish(lastValid);
+        else finish();
+      }, 10000);
     });
-  }, []);
-
-  const generateChallengeWithCompleted = (completedArray: ChallengeType[]) => {
-    const remaining = CHALLENGES.filter(c => !completedArray.includes(c));
-    if (remaining.length === 0) return;
-
-    const newChallenge =
-      remaining[Math.floor(Math.random() * remaining.length)];
-    setCurrentChallenge(newChallenge);
-    currentChallengeRef.current = newChallenge;
-
-    console.log('Nuevo reto generado:', newChallenge);
   };
 
-  // -------------------- Procesamiento de caras --------------------
-  const processFace = (faces: SimpleFace[]) => {
-    const challenge = currentChallengeRef.current;
-    if (!faces || faces.length === 0) {
-      setFaceDetected(false);
-      return;
-    }
+  // =========================
+  // INIT
+  // =========================
+  useEffect(() => {
+    const init = async () => {
+      try {
+        let cam = hasPermission;
 
-    setFaceDetected(true);
-    const face = faces[0];
-    if (!challenge) return;
-
-    const left = face.leftEyeOpenProbability ?? 1;
-    const right = face.rightEyeOpenProbability ?? 1;
-    const eyesOpen = left > blinkThresholdOpen && right > blinkThresholdOpen;
-    const eyesClosedNow =
-      left < blinkThresholdClosed && right < blinkThresholdClosed;
-
-    switch (challenge) {
-      case 'LEFT':
-        stableFramesRef.current =
-          (face.yawAngle ?? 0) > yawThreshold
-            ? stableFramesRef.current + 1
-            : Math.max(0, stableFramesRef.current - 1);
-
-        if (stableFramesRef.current >= stableFramesNeeded) {
-          stableFramesRef.current = 0;
-          completeChallenge();
+        if (!cam) {
+          cam = await requestPermission();
         }
-        break;
 
-      case 'RIGHT':
-        stableFramesRef.current =
-          (face.yawAngle ?? 0) < -yawThreshold
-            ? stableFramesRef.current + 1
-            : Math.max(0, stableFramesRef.current - 1);
-
-        if (stableFramesRef.current >= stableFramesNeeded) {
-          stableFramesRef.current = 0;
-          completeChallenge();
+        if (!cam) {
+          Alert.alert('Permiso de cámara requerido');
+          setReady(true);
+          return;
         }
-        break;
 
-      case 'SMILE':
-        stableFramesRef.current =
-          (face.smilingProbability ?? 0) > 0.5
-            ? stableFramesRef.current + 1
-            : Math.max(0, stableFramesRef.current - 1);
+        const loc = await requestLocationPermission();
 
-        if (stableFramesRef.current >= stableFramesNeeded) {
-          stableFramesRef.current = 0;
-          completeChallenge();
+        if (!loc) {
+          Alert.alert('Permiso ubicación denegado');
+          setReady(true);
+          return;
         }
-        break;
 
-      case 'BLINK3':
-        if (eyesClosedNow && !eyesClosedRef.current)
-          eyesClosedRef.current = true;
+        if (Platform.OS === 'android') {
+          let enabled = await isLocationEnabled();
 
-        if (eyesClosedRef.current && eyesOpen) {
-          eyesClosedRef.current = false;
-          blinkCountRef.current += 1;
-          setBlinkCount(blinkCountRef.current);
-
-          if (blinkCountRef.current >= 3) {
-            blinkCountRef.current = 0;
-            completeChallenge();
+          if (!enabled) {
+            try {
+              await promptForEnableLocationIfNeeded();
+            } catch {}
           }
         }
-        break;
+
+        try {
+          await getFastLocation();
+        } catch {}
+
+        setReady(true);
+      } catch (e) {
+        console.log('INIT ERROR', e);
+        setReady(true);
+      }
+    };
+
+    init();
+  }, []);
+
+  // =========================
+  // ANTI SPOOF
+  // =========================
+  const updateSpoofDetection = (face: SimpleFace) => {
+    if (!face.faceWidth || !face.faceHeight) {
+      return false;
     }
+
+    const size = face.faceWidth * face.faceHeight;
+
+    if (!lastFaceSizeRef.current) {
+      lastFaceSizeRef.current = size;
+      return false;
+    }
+
+    const diff = Math.abs(size - lastFaceSizeRef.current);
+
+    lastFaceSizeRef.current = size;
+
+    if (diff < 200) {
+      flatScoreRef.current += 1;
+    } else {
+      flatScoreRef.current = Math.max(0, flatScoreRef.current - 1);
+    }
+
+    return flatScoreRef.current >= 25;
   };
 
-  const handleDetectedFaces = (faces: SimpleFace[])=> {
-    processFace(faces);
-  };
+ 
+const blinkFramesRef = useRef(0);
+const blinkDetectedRef = useRef(false);
 
-  // 2️⃣ crea runOnJS UNA sola vez
- const runOnJSFaces = useMemo(() => {
-  return Worklets.createRunOnJS(handleDetectedFaces);
-}, [handleDetectedFaces]);
+const processFace = (faces: SimpleFace[]) => {
+  // =========================
+  // SIN ROSTRO
+  // =========================
+  if (!faces.length) {
+    setFaceDetected(false);
 
-const frameProcessor = useFrameProcessor(
-  (frame) => {
+    movementFramesRef.current = 0;
+    stableMovementRef.current = 0;
+    movementScoreRef.current = 0;
+    lastYawRef.current = null;
+    flatScoreRef.current = 0;
+
+    blinkFramesRef.current = 0;
+    blinkDetectedRef.current = false;
+
+    validatedRef.current = false;
+
+    safeSetMessage('Busca tu rostro');
+    return;
+  }
+
+  const face = faces[0];
+
+  setFaceDetected(true);
+
+  // =========================
+  // ANTI SPOOF FOTO/PANTALLA
+  // =========================
+  const spoofDetected = updateSpoofDetection(face);
+
+  if (spoofDetected) {
+    safeSetMessage('Movimiento sospechoso detectado');
+    return;
+  }
+
+  // =========================
+  // DETECCIÓN DE PARPADEO REAL
+  // =========================
+  const leftEye = face.leftEyeOpenProbability ?? 1;
+  const rightEye = face.rightEyeOpenProbability ?? 1;
+
+  const eyesClosed =
+    leftEye < 0.25 && rightEye < 0.25;
+
+  if (eyesClosed) {
+    blinkFramesRef.current += 1;
+  } else {
+    // Parpadeo válido
+    if (
+      blinkFramesRef.current >= 1 &&
+      blinkFramesRef.current <= 6
+    ) {
+      blinkDetectedRef.current = true;
+    }
+
+    blinkFramesRef.current = 0;
+  }
+
+  // =========================
+  // MOVIMIENTO NATURAL
+  // =========================
+  const currentYaw = face.yawAngle || 0;
+
+  if (lastYawRef.current === null) {
+    lastYawRef.current = currentYaw;
+
+    safeSetMessage('Muévete naturalmente');
+    return;
+  }
+
+  const yawDiff = Math.abs(
+    currentYaw - lastYawRef.current,
+  );
+
+  lastYawRef.current = currentYaw;
+
+  // Movimiento humano válido
+  if (yawDiff > 1 && yawDiff < 12) {
+    movementFramesRef.current += 1;
+    movementScoreRef.current += 1;
+  } else {
+    movementScoreRef.current = Math.max(
+      0,
+      movementScoreRef.current - 0.05,
+    );
+  }
+
+  // =========================
+  // VALIDAR MOVIMIENTO
+  // =========================
+  if (movementFramesRef.current < 8) {
+    safeSetMessage('Muévete naturalmente');
+    return;
+  }
+
+  // =========================
+  // VALIDAR PARPADEO
+  // =========================
+  if (!blinkDetectedRef.current) {
+    safeSetMessage('Verificando identidad...');
+    return;
+  }
+
+  // =========================
+  // ESTABILIDAD FINAL
+  // =========================
+  stableMovementRef.current += 1;
+
+  if (stableMovementRef.current < 10) {
+    safeSetMessage('Perfecto, mantente así');
+    return;
+  }
+
+  // =========================
+  // CAPTURA
+  // =========================
+  if (
+    !validatedRef.current &&
+    !capturingRef.current
+  ) {
+    validatedRef.current = true;
+    capturingRef.current = true;
+
+    safeSetMessage('Capturando foto...');
+
+    setTimeout(() => {
+      takeFinalPhoto();
+    }, 800);
+  }
+};
+
+  // =========================
+  // FRAME PROCESSOR
+  // =========================
+  const runOnJSFaces = useMemo(
+    () => Worklets.createRunOnJS(processFace),
+    [],
+  );
+
+  const frameProcessor = useFrameProcessor(frame => {
     'worklet';
-    if (!frame) return;
 
-    const detectedFaces = detectFaces(frame);
+    const faces = detectFaces(frame);
 
-    if (!detectedFaces || detectedFaces.length === 0) {
-      runOnJSFaces([]);
-      return;
-    }
-
-    const simplifiedFaces = detectedFaces.map(face => ({
-      yawAngle: face.yawAngle ?? 0,
-      smilingProbability: face.smilingProbability ?? 0,
-      leftEyeOpenProbability: face.leftEyeOpenProbability ?? 0,
-      rightEyeOpenProbability: face.rightEyeOpenProbability ?? 0,
+    const simplified = faces.map(f => ({
+      yawAngle: f.yawAngle ?? 0,
+      smilingProbability: f.smilingProbability ?? 0,
+      leftEyeOpenProbability: f.leftEyeOpenProbability ?? 0,
+      rightEyeOpenProbability: f.rightEyeOpenProbability ?? 0,
+      faceWidth: f.bounds?.width ?? 0,
+      faceHeight: f.bounds?.height ?? 0,
+      x: f.bounds?.x ?? 0,
+      y: f.bounds?.y ?? 0,
+      frameWidth: frame.width,
+      frameHeight: frame.height,
     }));
 
-    runOnJSFaces(simplifiedFaces);
-  },
-  [detectFaces, runOnJSFaces] // 👈 IMPORTANTE
-);
+    runOnJSFaces(simplified);
+  }, []);
 
-useEffect(() => {
-  let mounted = true;
-  let intervalId: ReturnType<typeof setInterval> | null = null;
-  let checking = false; // evita solapamiento de llamadas
+  // =========================
+  // GPS FORZADO
+  // =========================
+  useEffect(() => {
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+    let appState = AppState.currentState;
+    let showingPopup = false;
 
-  const checkGPS = async () => {
-    if (checking) return; // si ya está corriendo, saltar
-    checking = true;
+    const forceEnableGPS = async () => {
+      if (Platform.OS !== 'android') return;
+
+      const enabled = await isLocationEnabled();
+
+      if (!enabled && !showingPopup) {
+        showingPopup = true;
+
+        try {
+          await promptForEnableLocationIfNeeded();
+        } catch (error) {
+          console.log('Usuario canceló GPS');
+        }
+
+        showingPopup = false;
+      }
+    };
+
+    intervalId = setInterval(() => {
+      forceEnableGPS();
+    }, 2000);
+
+    const subscription = AppState.addEventListener(
+      'change',
+      nextState => {
+        if (
+          appState.match(/inactive|background/) &&
+          nextState === 'active'
+        ) {
+          forceEnableGPS();
+        }
+
+        appState = nextState;
+      },
+    );
+
+    forceEnableGPS();
+
+    return () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+      }
+
+      subscription.remove();
+    };
+  }, []);
+
+  // =========================
+  // FECHA
+  // =========================
+  const getFormattedDateTime = () => {
+    const now = new Date();
+
+    const pad = (n: number) => n.toString().padStart(2, '0');
+
+    const date = `${now.getFullYear()}-${pad(
+      now.getMonth() + 1,
+    )}-${pad(now.getDate())}`;
+
+    const time = `${pad(now.getHours())}:${pad(
+      now.getMinutes(),
+    )}:${pad(now.getSeconds())}`;
+
+    return { date, time };
+  };
+
+  // =========================
+  // FOTO FINAL
+  // =========================
+  const takeFinalPhoto = async (existingPhotoPath?: string) => {
+    if (processing) return;
+
+    setProcessing(true);
 
     try {
+      const photo = existingPhotoPath
+        ? {
+            path: existingPhotoPath.replace('file://', ''),
+          }
+        : await cameraRef.current!.takePhoto({
+            flash: 'off',
+          });
+
+      if (!photo?.path) {
+        throw new Error('No se pudo capturar la imagen');
+      }
+
+      const cleanPath = photo.path.replace('file://', '');
+
+      const exists = await RNFS.exists(cleanPath);
+
+      if (!exists) {
+        throw new Error('El archivo no existe');
+      }
+
+      const fileUri = `file://${cleanPath}`;
+
       const { latitude, longitude } = await getFastLocation();
-      if (!mounted) return;
 
-      const isValid = latitude !== 0 && longitude !== 0 ? 1 : 0;
+      const netState = await NetInfo.fetch();
 
-      setGpsReadings(prev => {
-        const newReadings = [...prev, isValid].slice(-3); // últimos 3 lecturas
-        const allValid = newReadings.every(r => r === 1);
+      // =========================
+      // OFFLINE
+      // =========================
+      if (
+        !netState.isConnected ||
+        !netState.isInternetReachable
+      ) {
+        const fileName = `face-${Date.now()}.jpg`;
 
-        setGpsEnabled(allValid); // true solo si las 3 últimas son válidas
-        return newReadings;
-      });
+        const blobPath = `${RNBlobUtil.fs.dirs.DocumentDir}/${fileName}`;
 
-      setLocation({ latitude, longitude });
-    } catch (err) {
-      if (!mounted) return;
-      setGpsEnabled(false);
-    } finally {
-      checking = false;
-    }
-  };
+        await RNBlobUtil.fs.cp(cleanPath, blobPath);
 
-  // Revisar inmediatamente
-  checkGPS();
+        const offlinePhotoUri = `file://${blobPath}`;
 
-  // Revisar cada 2 segundos
-  intervalId = setInterval(checkGPS, 2000);
+        const { date, time } = getFormattedDateTime();
 
-  return () => {
-    mounted = false;
-    if (intervalId) clearInterval(intervalId);
-  };
-}, []);
+        await addToQueue({
+          contact_id,
+          photoUri: offlinePhotoUri,
+          latitude,
+          longitude,
+          date,
+          time,
+        });
 
-const savePhotoOffline = async (photoPath: string): Promise<string> => {
-  // photoPath = ruta devuelta por la cámara, normalmente algo como:
-  // /data/user/0/com.tuapp/cache/face-12345.jpg
-  const fileName = `face-${Date.now()}.jpg`;
-  const destPath = `${RNBlobUtil.fs.dirs.CacheDir}/${fileName}`;
+        Alert.alert(
+          'Verificación guardada',
+          'Se enviará automáticamente cuando recuperes conexión',
+        );
 
-  try {
-    // Copia la foto al cache de la app
-    await RNBlobUtil.fs.cp(photoPath, destPath);
-    console.log('📁 Imagen guardada offline en:', destPath);
-    return `file://${destPath}`; // Devuelve la ruta lista para usar
-  } catch (err) {
-    console.log('❌ Error guardando imagen offline', err);
-    throw err;
-  }
-};
+        navigation.replace('Login' as never);
 
-const takeFinalPhoto = async (existingPhotoPath?: string) => {
-  if (processing) return;
-  setProcessing(true);
+        return;
+      }
 
-  try {
-    // 1️⃣ Tomar foto o usar existente
-    const photo = existingPhotoPath
-      ? { path: existingPhotoPath.replace('file://', '') }
-      : await cameraRef.current!.takePhoto({ flash: 'off' });
+      // =========================
+      // SUBIR FOTO
+      // =========================
+      const formData = new FormData();
 
-    if (!photo?.path) throw new Error('No se pudo capturar la imagen');
+      formData.append('contact_id', String(contact_id));
+      formData.append('latitude', String(latitude));
+      formData.append('longitude', String(longitude));
 
-    // 🔥 IMPORTANTE: limpiar doble file://
-    const cleanPath = photo.path.replace('file://', '');
+      formData.append(
+        'photo',
+        {
+          uri: fileUri,
+          name: 'face.jpg',
+          type: 'image/jpeg',
+        } as any,
+      );
 
-    const exists = await RNFS.exists(cleanPath);
-    console.log('EXISTE FOTO?', exists, cleanPath);
+      const res = await fetch(
+        `${BASE_URL}contacts/verify`,
+        {
+          method: 'PUT',
+          body: formData,
+        },
+      );
 
-    if (!exists) throw new Error('El archivo no existe');
+      const data = await res.json();
 
-    const fileUri = `file://${cleanPath}`;
+      if (!res.ok) {
+        throw new Error(data.message || 'Error subiendo foto');
+      }
 
-    // 2️⃣ Ubicación
-    const { latitude, longitude } = await getFastLocation();
+      if (!existingPhotoPath && (await RNFS.exists(cleanPath))) {
+        await RNFS.unlink(cleanPath);
+      }
 
-    // 3️⃣ Verificar internet
-    const netState = await NetInfo.fetch();
-    if (!netState.isConnected || !netState.isInternetReachable) {
-       const fileName = `face-${Date.now()}.jpg`;
-      const blobPath = `${RNBlobUtil.fs.dirs.CacheDir}/${fileName}`;
+      Alert.alert(
+        'Verificación exitosa',
+        'Tu identidad fue validada',
+      );
 
-      await RNBlobUtil.fs.cp(cleanPath, blobPath);
-      console.log('💾 Foto guardada offline en:', blobPath);
-
-      const offlinePhotoUri = `file://${blobPath}`;
-
-      await addToQueue({
-        contact_id,
-        photoUri: offlinePhotoUri,
-        latitude,
-        longitude,
-        date: new Date().toLocaleDateString(),
-        time: new Date().toLocaleTimeString(),
-      });
-
-      Alert.alert('Guardado', 'Se sincronizará cuando tengas conexión');
       navigation.replace('Login' as never);
-      return;
+    } catch (err) {
+      console.log('ERROR FINALIZANDO VERIFICACIÓN', err);
+
+      Alert.alert(
+        'Inténtalo nuevamente',
+        'No se pudo procesar la foto',
+      );
+
+      navigation.replace('Login' as never);
+    } finally {
+      setProcessing(false);
     }
+  };
 
-    // 4️⃣ Enviar al servidor
-    const formData = new FormData();
-    formData.append('contact_id', String(contact_id));
-    formData.append('latitude', String(latitude));
-    formData.append('longitude', String(longitude));
-    formData.append('photo', {
-      uri: fileUri,
-      name: 'face.jpg',
-      type: 'image/jpeg',
-    } as any);
-
-    const res = await fetch(`${BASE_URL}contacts/verify`, {
-      method: 'PUT',
-      body: formData,
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.message || 'Error subiendo foto');
-
-    // 5️⃣ Borrar SOLO si fue tomada ahora
-    if (!existingPhotoPath && await RNFS.exists(cleanPath)) {
-      await RNFS.unlink(cleanPath);
-    }
-
-    Alert.alert('✅ Éxito', data.message);
-    navigation.replace('Login' as never);
-
-  } catch (err) {
-    console.log('❌ Error:', err);
-    Alert.alert('Error', 'No se pudo procesar la foto');
-  } finally {
-    setProcessing(false);
-  }
-};
-
-  if (!device || !hasPermission || !ready) {
+  // =========================
+  // LOADING
+  // =========================
+  if (!device || !ready) {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="large" color="#22c55e" />
-        <Text style={styles.text}>Cargando</Text>
+
+        <Text style={styles.text}>Cargando...</Text>
       </View>
     );
   }
 
+  // =========================
+  // UI
+  // =========================
   return (
     <SafeAreaView style={styles.container}>
+      <View style={styles.faceGuideContainer}>
+        <View style={styles.faceOval} />
+      </View>
+
       <Camera
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
@@ -544,143 +709,100 @@ const takeFinalPhoto = async (existingPhotoPath?: string) => {
         format={format}
         frameProcessor={frameProcessor}
       />
-      {!gpsEnabled && (
-  <View style={styles.gpsOverlay}>
-    <Text style={styles.gpsText}>
-      GPS desactivado. Actívalo para continuar.
-    </Text>
-    <TouchableOpacity
-      onPress={() => {
-        if (Platform.OS === 'android') Linking.openSettings();
-        else Linking.openURL('App-Prefs:Privacy&path=LOCATION');
-      }}
-      style={styles.gpsButton}
-    >
-      <Text style={styles.gpsButtonText}>Abrir configuración</Text>
-    </TouchableOpacity>
-  </View>
-)}
+
       <View style={styles.overlay}>
         <TouchableOpacity
           style={styles.backButton}
-          onPress={() => {
-            Alert.alert('Cancelar', '¿Deseas salir ?', [
-              { text: 'No' },
-              {
-                text: 'Sí',
-                onPress: () => navigation.goBack(), // regresa a la pantalla anterior
-              },
-            ]);
-          }}
+          onPress={() => navigation.goBack()}
         >
           <Text style={styles.backButtonText}>Atrás</Text>
         </TouchableOpacity>
-        <View style={styles.progressContainer}>
-          {CHALLENGES.map(c => (
-            <View
-              key={c}
-              style={[
-                styles.progressDot,
-                completed.includes(c)
-                  ? { backgroundColor: '#22c55e' }
-                  : { borderColor: '#fff', backgroundColor: 'transparent' },
-              ]}
-            />
-          ))}
-        </View>
-        <Text style={styles.challenge}>
-          {getChallengeText(currentChallenge, blinkCount)}
-        </Text>
+
+        <Text style={styles.challenge}>{faceMessage}</Text>
       </View>
+
       {processing && (
         <View style={styles.loaderOverlay}>
           <ActivityIndicator size="large" color="#22c55e" />
-          <Text style={{ color: '#fff', marginTop: 10 }}>Cargando...</Text>
         </View>
       )}
     </SafeAreaView>
   );
 }
 
-function getChallengeText(challenge: ChallengeType | null, blinkCount: number) {
-  switch (challenge) {
-    case 'LEFT':
-      return 'Gira a la izquierda';
-    case 'RIGHT':
-      return 'Gira a la derecha';
-    case 'SMILE':
-      return 'Sonríe';
-    case 'BLINK3':
-      return `Parpadea 3 veces (${blinkCount}/3)`;
-    default:
-      return 'Preparando…';
-  }
-}
-
+// =========================
+// STYLES
+// =========================
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
-  overlay: {
-    ...StyleSheet.absoluteFillObject,
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    paddingBottom: 120,
+  container: {
+    flex: 1,
+    backgroundColor: '#000',
   },
-  challenge: {
-    marginTop: 10,
-    fontSize: 20,
-    color: '#fff',
-    fontWeight: 'bold',
-    textAlign: 'center',
-    paddingHorizontal: 20,
-    width: '90%',
-  },
+
   center: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: '#000',
   },
-  text: { color: '#fff',fontWeight:"bold",marginTop: 10 },
-  progressContainer: {
-    flexDirection: 'row',
+
+  text: {
+    color: '#fff',
+    marginTop: 10,
+  },
+
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    paddingBottom: 120,
+  },
+
+  challenge: {
+  fontSize: 28,
+  color: 'white',
+  fontWeight: 'bold',
+  backgroundColor: '#C62828',
+  paddingHorizontal: 16,
+  paddingVertical: 10,
+  borderRadius: 12,
+  overflow: 'hidden',
+  textAlign: 'center',
+},
+
+  faceGuideContainer: {
+    ...StyleSheet.absoluteFillObject,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 10,
-    gap: 10,
   },
-  progressDot: { width: 20, height: 20, borderRadius: 10, borderWidth: 2 },
+
+  faceOval: {
+    width: 220,
+    height: 300,
+    borderRadius: 160,
+    borderWidth: 3,
+    borderColor: '#22c55e',
+    backgroundColor: 'transparent',
+  },
+
   backButton: {
     position: 'absolute',
     top: 50,
     left: 20,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    paddingVertical: 8,
-    paddingHorizontal: 15,
+    backgroundColor: '#0008',
+    padding: 10,
     borderRadius: 8,
-    zIndex: 10,
-    width: 80,
   },
-  gpsOverlay: {
-  ...StyleSheet.absoluteFillObject,
-  justifyContent: 'center',
-  alignItems: 'center',
-  backgroundColor: 'rgba(0,0,0,0.8)',
-  zIndex: 50,
-},
-gpsText: { color: 'white', fontSize: 18, textAlign: 'center', marginBottom: 20 },
-gpsButton: { backgroundColor: '#22c55e', padding: 12, borderRadius: 8 },
-gpsButtonText: { color: 'white', fontWeight: 'bold' },
 
   backButtonText: {
     color: '#fff',
-    fontSize: 16,
-    fontWeight: 'bold',
   },
+
   loaderOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: '#0006',
     justifyContent: 'center',
     alignItems: 'center',
-    zIndex: 20,
   },
 });
+

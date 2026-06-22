@@ -45,12 +45,13 @@ react {
 
     /* Hermes Commands */
     //   The hermes compiler command to run. By default it is 'hermesc'
-    // hermesCommand = "$rootDir/my-custom-hermesc/bin/hermesc"
+     //hermesCommand = "$rootDir/my-custom-hermesc/bin/hermesc"
     //
     //   The list of flags to pass to the Hermes compiler. By default is "-O", "-output-source-map"
     // hermesFlags = ["-O", "-output-source-map"]
 
     /* Autolinking */
+    enableBundleCompression = false
     autolinkLibrariesWithApp()
 }
 
@@ -78,6 +79,7 @@ android {
     compileSdk rootProject.ext.compileSdkVersion
 
     namespace "com.biometriafacial"
+
     defaultConfig {
         applicationId "com.biometriafacial"
         minSdkVersion 26
@@ -85,6 +87,8 @@ android {
         versionCode 1
         versionName "1.0"
     }
+
+    // 🔐 CONFIGURACIÓN DE FIRMA
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -92,28 +96,38 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+
+        release {
+            storeFile file("my-key.keystore") // 🔥 ruta directa (más segura)
+            storePassword "123456"
+            keyAlias "my-key-alias"
+            keyPassword "123456"
+        }
     }
+
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
+
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
             minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources false
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 }
 
 dependencies {
-    // The version of react-native is set by the React Native Gradle Plugin
+
     implementation("com.facebook.react:react-android")
 
-    if (hermesEnabled.toBoolean()) {
-        implementation("com.facebook.react:hermes-android")
-    } else {
-        implementation jscFlavor
+  
+}
+
+tasks.configureEach { task ->
+    if (task.name == "createBundleReleaseJsAndAssets") {
+        task.enabled = false
     }
 }

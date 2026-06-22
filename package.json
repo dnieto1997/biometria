@@ -19,6 +19,7 @@
     "axios": "^1.13.5",
     "react": "19.2.3",
     "react-native": "0.84.0",
+    "react-native-android-location-enabler": "^3.0.1",
     "react-native-blob-util": "^0.24.7",
     "react-native-fs": "^2.20.0",
     "react-native-geolocation-service": "^5.3.1",

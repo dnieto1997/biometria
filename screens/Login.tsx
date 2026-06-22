@@ -44,7 +44,7 @@ export default function LoginScreen() {
 
   const handleLogin = async () => {
     if (!cedula.trim()) {
-      Alert.alert("Error", "Por favor ingresa tu cédula");
+      Alert.alert("Error", "Por favor ingresa tu numero de identificación");
       return;
     }
 
@@ -83,7 +83,7 @@ export default function LoginScreen() {
       );
 
       if (!foundUser) {
-        Alert.alert("Error", "La cédula no está registrada");
+        Alert.alert("Error", "La identificacion no está registrada");
         return;
       }
 
@@ -103,7 +103,7 @@ export default function LoginScreen() {
         contact_id: String(foundUser.contact_id),
       });
     } catch (error: any) {
-      Alert.alert("Error", "No se pudo verificar la cédula");
+      Alert.alert("Error", "No se pudo verificar la identificación. Intente nuevamente.");
     } finally {
       setLoading(false);
     }
@@ -123,12 +123,12 @@ export default function LoginScreen() {
 
         <Text style={styles.title}>Control de Asistencia</Text>
         <Text style={styles.subtitle}>
-          Ingrese su número de cédula para continuar
+          Ingrese su número de identificación para continuar
         </Text>
 
         <TextInput
           style={styles.input}
-          placeholder="Número de cédula"
+          placeholder="Número de identificación"
           placeholderTextColor={COLORS.placeholder}
           keyboardType="numeric"
           value={cedula}
