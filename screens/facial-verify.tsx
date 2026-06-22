@@ -312,7 +312,6 @@ export default function FacialVerify() {
     return flatScoreRef.current >= 25;
   };
 
- 
 const blinkFramesRef = useRef(0);
 const blinkDetectedRef = useRef(false);
 
